@@ -1,7 +1,7 @@
 const std = @import("std");
 const assert = @import("../../../quirks.zig").inlineAssert;
 
-const cimgui = @import("cimgui");
+const cimgui = @import("dcimgui");
 const gl = @import("opengl");
 const adw = @import("adw");
 const gdk = @import("gdk");
@@ -126,26 +126,22 @@ pub const ImguiWidget = extern struct {
             log.warn("Dear ImGui context not initialized", .{});
             return error.ContextNotInitialized;
         };
-        cimgui.c.igSetCurrentContext(ig_context);
+        cimgui.c.ImGui_SetCurrentContext(ig_context);
     }
 
     /// Initialize the frame. Expects that the context is already current.
     fn newFrame(self: *Self) void {
-        // If we can't determine the time since the last frame we default to
-        // 1/60th of a second.
-        const default_delta_time = 1 / 60;
-
         const priv = self.private();
-
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
 
         // Determine our delta time
         const now = std.time.Instant.now() catch unreachable;
         io.DeltaTime = if (priv.instant) |prev| delta: {
-            const since_ns = now.since(prev);
-            const since_s: f32 = @floatFromInt(since_ns / std.time.ns_per_s);
+            const since_ns: f64 = @floatFromInt(now.since(prev));
+            const ns_per_s: f64 = @floatFromInt(std.time.ns_per_s);
+            const since_s: f32 = @floatCast(since_ns / ns_per_s);
             break :delta @max(0.00001, since_s);
-        } else default_delta_time;
+        } else (1.0 / 60.0);
 
         priv.instant = now;
     }
@@ -163,7 +159,7 @@ pub const ImguiWidget = extern struct {
 
         self.setCurrentContext() catch return false;
 
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
 
         const mods = key.translateMods(gtk_mods);
         cimgui.c.ImGuiIO_AddKeyEvent(io, cimgui.c.ImGuiKey_LeftShift, mods.shift);
@@ -219,14 +215,14 @@ pub const ImguiWidget = extern struct {
             return;
         }
 
-        priv.ig_context = cimgui.c.igCreateContext(null) orelse {
+        priv.ig_context = cimgui.c.ImGui_CreateContext(null) orelse {
             log.warn("unable to initialize Dear ImGui context", .{});
             return;
         };
         self.setCurrentContext() catch return;
 
         // Setup some basic config
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         io.BackendPlatformName = "ghostty_gtk";
 
         // Realize means that our OpenGL context is ready, so we can now
@@ -247,7 +243,7 @@ pub const ImguiWidget = extern struct {
     /// Handle a request to resize the GLArea
     fn glAreaResize(area: *gtk.GLArea, width: c_int, height: c_int, self: *Self) callconv(.c) void {
         self.setCurrentContext() catch return;
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         const scale_factor = area.as(gtk.Widget).getScaleFactor();
 
         // Our display size is always unscaled. We'll do the scaling in the
@@ -255,12 +251,14 @@ pub const ImguiWidget = extern struct {
         io.DisplaySize = .{ .x = @floatFromInt(width), .y = @floatFromInt(height) };
         io.DisplayFramebufferScale = .{ .x = 1, .y = 1 };
 
-        // Setup a new style and scale it appropriately.
-        const style = cimgui.c.ImGuiStyle_ImGuiStyle();
-        defer cimgui.c.ImGuiStyle_destroy(style);
-        cimgui.c.ImGuiStyle_ScaleAllSizes(style, @floatFromInt(scale_factor));
-        const active_style = cimgui.c.igGetStyle();
-        active_style.* = style.*;
+        // Setup a new style and scale it appropriately. We must use the
+        // ImGuiStyle constructor to get proper default values (e.g.,
+        // CurveTessellationTol) rather than zero-initialized values.
+        var style: cimgui.c.ImGuiStyle = undefined;
+        cimgui.ext.ImGuiStyle_ImGuiStyle(&style);
+        cimgui.c.ImGuiStyle_ScaleAllSizes(&style, @floatFromInt(scale_factor));
+        const active_style = cimgui.c.ImGui_GetStyle();
+        active_style.* = style;
     }
 
     /// Handle a request to render the contents of our GLArea
@@ -273,33 +271,33 @@ pub const ImguiWidget = extern struct {
         for (0..2) |_| {
             cimgui.ImGui_ImplOpenGL3_NewFrame();
             self.newFrame();
-            cimgui.c.igNewFrame();
+            cimgui.c.ImGui_NewFrame();
 
             // Call the virtual method to draw the UI.
             self.render();
 
             // Render
-            cimgui.c.igRender();
+            cimgui.c.ImGui_Render();
         }
 
         // OpenGL final render
         gl.clearColor(0x28 / 0xFF, 0x2C / 0xFF, 0x34 / 0xFF, 1.0);
         gl.clear(gl.c.GL_COLOR_BUFFER_BIT);
-        cimgui.ImGui_ImplOpenGL3_RenderDrawData(cimgui.c.igGetDrawData());
+        cimgui.ImGui_ImplOpenGL3_RenderDrawData(cimgui.c.ImGui_GetDrawData());
 
         return @intFromBool(true);
     }
 
     fn ecFocusEnter(_: *gtk.EventControllerFocus, self: *Self) callconv(.c) void {
         self.setCurrentContext() catch return;
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         cimgui.c.ImGuiIO_AddFocusEvent(io, true);
         self.queueRender();
     }
 
     fn ecFocusLeave(_: *gtk.EventControllerFocus, self: *Self) callconv(.c) void {
         self.setCurrentContext() catch return;
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         cimgui.c.ImGuiIO_AddFocusEvent(io, false);
         self.queueRender();
     }
@@ -345,7 +343,7 @@ pub const ImguiWidget = extern struct {
     ) callconv(.c) void {
         self.queueRender();
         self.setCurrentContext() catch return;
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         const gdk_button = gesture.as(gtk.GestureSingle).getCurrentButton();
         if (translateMouseButton(gdk_button)) |button| {
             cimgui.c.ImGuiIO_AddMouseButtonEvent(io, button, true);
@@ -361,7 +359,7 @@ pub const ImguiWidget = extern struct {
     ) callconv(.c) void {
         self.queueRender();
         self.setCurrentContext() catch return;
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         const gdk_button = gesture.as(gtk.GestureSingle).getCurrentButton();
         if (translateMouseButton(gdk_button)) |button| {
             cimgui.c.ImGuiIO_AddMouseButtonEvent(io, button, false);
@@ -376,7 +374,7 @@ pub const ImguiWidget = extern struct {
     ) callconv(.c) void {
         self.queueRender();
         self.setCurrentContext() catch return;
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         const scale_factor = self.getScaleFactor();
         cimgui.c.ImGuiIO_AddMousePosEvent(
             io,
@@ -393,7 +391,7 @@ pub const ImguiWidget = extern struct {
     ) callconv(.c) c_int {
         self.queueRender();
         self.setCurrentContext() catch return @intFromBool(false);
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         cimgui.c.ImGuiIO_AddMouseWheelEvent(
             io,
             @floatCast(x),
@@ -409,7 +407,7 @@ pub const ImguiWidget = extern struct {
     ) callconv(.c) void {
         self.queueRender();
         self.setCurrentContext() catch return;
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         cimgui.c.ImGuiIO_AddInputCharactersUTF8(io, bytes);
     }
 
