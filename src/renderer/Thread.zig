@@ -294,25 +294,20 @@ fn setQosClass(self: *const Thread) void {
 
 fn syncDrawTimer(self: *Thread) void {
     skip: {
-        // If we have an inspector, we always run the draw timer.
-        if (self.flags.has_inspector) break :skip;
-
         // If our renderer supports animations and has them, then we
-        // always have a draw timer.
+        // can apply draw timer based on custom shader animation configuration.
         if (@hasDecl(rendererpkg.Renderer, "hasAnimations") and
             self.renderer.hasAnimations())
         {
-            break :skip;
-        }
-
-        // If our config says to always animate, we do so.
-        switch (self.config.custom_shader_animation) {
-            // Always animate
-            .always => break :skip,
-            // Only when focused
-            .true => if (self.flags.focused) break :skip,
-            // Never animate
-            .false => {},
+            // If our config says to always animate, we do so.
+            switch (self.config.custom_shader_animation) {
+                // Always animate
+                .always => break :skip,
+                // Only when focused
+                .true => if (self.flags.focused) break :skip,
+                // Never animate
+                .false => {},
+            }
         }
 
         // We're skipping the draw timer. Stop it on the next iteration.
@@ -479,9 +474,6 @@ fn drainMailbox(self: *Thread) !void {
 
             .inspector => |v| {
                 self.flags.has_inspector = v;
-                // Reset our draw timer state, which might change due
-                // to the inspector change.
-                self.syncDrawTimer();
             },
 
             .macos_display_id => |v| {
@@ -613,11 +605,6 @@ fn renderCallback(
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
-
-    // If we have an inspector, let the app know we want to rerender that.
-    if (t.flags.has_inspector) {
-        _ = t.app_mailbox.push(.{ .redraw_inspector = t.surface }, .{ .instant = {} });
-    }
 
     // Update our frame data
     t.renderer.updateFrame(

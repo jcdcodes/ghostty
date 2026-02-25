@@ -17,6 +17,7 @@ const charsets = @import("charsets.zig");
 const csi = @import("csi.zig");
 const hyperlink = @import("hyperlink.zig");
 const kitty = @import("kitty.zig");
+const osc = @import("osc.zig");
 const point = @import("point.zig");
 const sgr = @import("sgr.zig");
 const Tabstops = @import("Tabstops.zig");
@@ -79,11 +80,10 @@ mouse_shape: mouse_shape_pkg.MouseShape = .text,
 
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
-    // This isn't a mode, this is set by OSC 133 using the "A" event.
-    // If this is true, it tells us that the shell supports redrawing
-    // the prompt and that when we resize, if the cursor is at a prompt,
-    // then we should clear the screen below and allow the shell to redraw.
-    shell_redraws_prompt: bool = false,
+    // This supports a Kitty extension where programs using semantic
+    // prompts (OSC133) can annotate their new prompts with `redraw=0` to
+    // disable clearing the prompt on resize.
+    shell_redraws_prompt: osc.semantic_prompt.Redraw = .true,
 
     // This is set via ESC[4;2m. Any other modify key mode just sets
     // this to false and we act in mode 1 by default.
@@ -329,12 +329,16 @@ pub fn print(self: *Terminal, c: u21) !void {
         @branchHint(.unlikely);
         // We need the previous cell to determine if we're at a grapheme
         // break or not. If we are NOT, then we are still combining the
-        // same grapheme. Otherwise, we can stay in this cell.
+        // same grapheme, and will be appending to prev.cell. Otherwise, we are
+        // in a new cell.
         const Prev = struct { cell: *Cell, left: size.CellCountInt };
-        const prev: Prev = prev: {
+        var prev: Prev = prev: {
             const left: size.CellCountInt = left: {
-                // If we have wraparound, then we always use the prev col
-                if (self.modes.get(.wraparound)) break :left 1;
+                // If we have wraparound, then we use the prev col unless
+                // there's a pending wrap, in which case we use the current.
+                if (self.modes.get(.wraparound)) {
+                    break :left @intFromBool(!self.screens.active.cursor.pending_wrap);
+                }
 
                 // If we do not have wraparound, the logic is trickier. If
                 // we're not on the last column, then we just use the previous
@@ -380,6 +384,8 @@ pub fn print(self: *Terminal, c: u21) !void {
         // If we can NOT break, this means that "c" is part of a grapheme
         // with the previous char.
         if (!grapheme_break) {
+            var desired_wide: enum { no_change, wide, narrow } = .no_change;
+
             // If this is an emoji variation selector then we need to modify
             // the cell width accordingly. VS16 makes the character wide and
             // VS15 makes it narrow.
@@ -390,71 +396,132 @@ pub fn print(self: *Terminal, c: u21) !void {
                 if (!prev_props.emoji_vs_base) return;
 
                 switch (c) {
-                    0xFE0F => wide: {
-                        if (prev.cell.wide == .wide) break :wide;
+                    0xFE0F => desired_wide = .wide,
+                    0xFE0E => desired_wide = .narrow,
+                    else => unreachable,
+                }
+            } else if (!unicode.table.get(c).width_zero_in_grapheme) {
+                // If we have a code point that contributes to the width of a
+                // grapheme, it necessarily means that we're at least at width
+                // 2, since the first code point must be at least width 1 to
+                // start. (Note that Prepend code points could effectively mean
+                // the first code point should be width 0, but we don't handle
+                // that yet.)
+                desired_wide = .wide;
+            }
 
-                        // Move our cursor back to the previous. We'll move
-                        // the cursor within this block to the proper location.
-                        self.screens.active.cursorLeft(prev.left);
+            switch (desired_wide) {
+                .wide => wide: {
+                    if (prev.cell.wide == .wide) break :wide;
 
-                        // If we don't have space for the wide char, we need
-                        // to insert spacers and wrap. Then we just print the wide
-                        // char as normal.
-                        if (self.screens.active.cursor.x == right_limit - 1) {
-                            if (!self.modes.get(.wraparound)) return;
+                    // Move our cursor back to the previous. We'll move
+                    // the cursor within this block to the proper location.
+                    self.screens.active.cursorLeft(prev.left);
+
+                    // If we don't have space for the wide char, we need to
+                    // insert spacers and wrap. We need special handling if the
+                    // previous cell has grapheme data.
+                    if (self.screens.active.cursor.x == right_limit - 1) {
+                        if (!self.modes.get(.wraparound)) return;
+
+                        const prev_cp = prev.cell.content.codepoint;
+
+                        if (prev.cell.hasGrapheme()) {
+                            // This is like printCell but without clearing the
+                            // grapheme data from the cell, so we can move it
+                            // later.
+                            prev.cell.wide = if (right_limit == self.cols) .spacer_head else .narrow;
+                            prev.cell.content.codepoint = 0;
+
+                            try self.printWrap();
+                            self.printCell(prev_cp, .wide);
+
+                            const new_pin = self.screens.active.cursor.page_pin.*;
+                            const new_rac = new_pin.rowAndCell();
+
+                            transfer_graphemes: {
+                                var old_pin = self.screens.active.cursor.page_pin.up(1) orelse break :transfer_graphemes;
+                                old_pin.x = right_limit - 1;
+                                const old_rac = old_pin.rowAndCell();
+
+                                if (new_pin.node == old_pin.node) {
+                                    new_pin.node.data.moveGrapheme(prev.cell, new_rac.cell);
+                                    prev.cell.content_tag = .codepoint;
+                                    new_rac.cell.content_tag = .codepoint_grapheme;
+                                    new_rac.row.grapheme = true;
+                                } else {
+                                    const cps = old_pin.node.data.lookupGrapheme(old_rac.cell).?;
+                                    for (cps) |cp| {
+                                        try self.screens.active.appendGrapheme(new_rac.cell, cp);
+                                    }
+                                    old_pin.node.data.clearGrapheme(old_rac.cell);
+                                }
+
+                                old_pin.node.data.updateRowGraphemeFlag(old_rac.row);
+                            }
+
+                            // Point prev.cell to our new previous cell that
+                            // we'll be appending graphemes to
+                            prev.cell = new_rac.cell;
+                        } else {
                             self.printCell(
                                 0,
                                 if (right_limit == self.cols) .spacer_head else .narrow,
                             );
                             try self.printWrap();
+                            self.printCell(prev_cp, .wide);
+
+                            // Point prev.cell to our new previous cell that
+                            // we'll be appending graphemes to
+                            prev.cell = self.screens.active.cursor.page_cell;
                         }
+                    } else {
+                        prev.cell.wide = .wide;
+                    }
 
-                        self.printCell(prev.cell.content.codepoint, .wide);
+                    // Write our spacer, since prev.cell is now wide
+                    self.screens.active.cursorRight(1);
+                    self.printCell(0, .spacer_tail);
 
-                        // Write our spacer
+                    // Move the cursor again so we're beyond our spacer
+                    if (self.screens.active.cursor.x == right_limit - 1) {
+                        self.screens.active.cursor.pending_wrap = true;
+                    } else {
                         self.screens.active.cursorRight(1);
-                        self.printCell(0, .spacer_tail);
+                    }
+                },
 
-                        // Move the cursor again so we're beyond our spacer
-                        if (self.screens.active.cursor.x == right_limit - 1) {
-                            self.screens.active.cursor.pending_wrap = true;
-                        } else {
-                            self.screens.active.cursorRight(1);
-                        }
-                    },
+                .narrow => narrow: {
+                    // Prev cell is no longer wide
+                    if (prev.cell.wide != .wide) break :narrow;
+                    prev.cell.wide = .narrow;
 
-                    0xFE0E => narrow: {
-                        // Prev cell is no longer wide
-                        if (prev.cell.wide != .wide) break :narrow;
-                        prev.cell.wide = .narrow;
+                    // Remove the wide spacer tail
+                    const cell = self.screens.active.cursorCellLeft(prev.left - 1);
+                    cell.wide = .narrow;
 
-                        // Remove the wide spacer tail
-                        const cell = self.screens.active.cursorCellLeft(prev.left - 1);
-                        cell.wide = .narrow;
+                    // Back track the cursor so that we don't end up with
+                    // an extra space after the character. Since xterm is
+                    // not VS aware, it cannot be used as a reference for
+                    // this behavior; but it does follow the principle of
+                    // least surprise, and also matches the behavior that
+                    // can be observed in Kitty, which is one of the only
+                    // other VS aware terminals.
+                    if (self.screens.active.cursor.x == right_limit - 1) {
+                        // If we're already at the right edge, we stay
+                        // here and set the pending wrap to false since
+                        // when we pend a wrap, we only move our cursor once
+                        // even for wide chars (tests verify).
+                        self.screens.active.cursor.pending_wrap = false;
+                    } else {
+                        // Otherwise, move back.
+                        self.screens.active.cursorLeft(1);
+                    }
 
-                        // Back track the cursor so that we don't end up with
-                        // an extra space after the character. Since xterm is
-                        // not VS aware, it cannot be used as a reference for
-                        // this behavior; but it does follow the principle of
-                        // least surprise, and also matches the behavior that
-                        // can be observed in Kitty, which is one of the only
-                        // other VS aware terminals.
-                        if (self.screens.active.cursor.x == right_limit - 1) {
-                            // If we're already at the right edge, we stay
-                            // here and set the pending wrap to false since
-                            // when we pend a wrap, we only move our cursor once
-                            // even for wide chars (tests verify).
-                            self.screens.active.cursor.pending_wrap = false;
-                        } else {
-                            // Otherwise, move back.
-                            self.screens.active.cursorLeft(1);
-                        }
+                    break :narrow;
+                },
 
-                        break :narrow;
-                    },
-
-                    else => unreachable,
-                }
+                else => {},
             }
 
             log.debug("c={X} grapheme attach to left={} primary_cp={X}", .{
@@ -711,6 +778,7 @@ fn printCell(
         .style_id = self.screens.active.cursor.style_id,
         .wide = wide,
         .protected = self.screens.active.cursor.protected,
+        .semantic_content = self.screens.active.cursor.semantic_content,
     };
 
     if (style_changed) {
@@ -753,22 +821,35 @@ fn printWrap(self: *Terminal) !void {
     // We only mark that we soft-wrapped if we're at the edge of our
     // full screen. We don't mark the row as wrapped if we're in the
     // middle due to a right margin.
-    const mark_wrap = self.screens.active.cursor.x == self.cols - 1;
-    if (mark_wrap) self.screens.active.cursor.page_row.wrap = true;
+    const cursor: *Screen.Cursor = &self.screens.active.cursor;
+    const mark_wrap = cursor.x == self.cols - 1;
+    if (mark_wrap) cursor.page_row.wrap = true;
 
     // Get the old semantic prompt so we can extend it to the next
     // line. We need to do this before we index() because we may
     // modify memory.
-    const old_prompt = self.screens.active.cursor.page_row.semantic_prompt;
+    const old_semantic = cursor.semantic_content;
+    const old_semantic_clear = cursor.semantic_content_clear_eol;
 
     // Move to the next line
     try self.index();
     self.screens.active.cursorHorizontalAbsolute(self.scrolling_region.left);
 
+    // Our pointer should never move
+    assert(cursor == &self.screens.active.cursor);
+
+    // We always reset our semantic prompt state
+    cursor.semantic_content = old_semantic;
+    cursor.semantic_content_clear_eol = old_semantic_clear;
+    switch (old_semantic) {
+        .output, .input => {},
+        .prompt => cursor.page_row.semantic_prompt = .prompt_continuation,
+    }
+
     if (mark_wrap) {
-        // New line must inherit semantic prompt of the old line
-        self.screens.active.cursor.page_row.semantic_prompt = old_prompt;
-        self.screens.active.cursor.page_row.wrap_continuation = true;
+        const row = self.screens.active.cursor.page_row;
+        // Always mark the row as a continuation
+        row.wrap_continuation = true;
     }
 
     // Assure that our screen is consistent
@@ -1057,6 +1138,153 @@ pub fn setProtectedMode(self: *Terminal, mode: ansi.ProtectedMode) void {
     }
 }
 
+/// Perform a semantic prompt command.
+///
+/// If there is an error, we do our best to get the terminal into
+/// some coherent state, since callers typically can't handle errors
+/// (since they're sending sequences via the pty).
+pub fn semanticPrompt(
+    self: *Terminal,
+    cmd: osc.Command.SemanticPrompt,
+) !void {
+    switch (cmd.action) {
+        .fresh_line => try self.semanticPromptFreshLine(),
+
+        .fresh_line_new_prompt => {
+            // "First do a fresh-line."
+            try self.semanticPromptFreshLine();
+
+            const screen: *Screen = self.screens.active;
+
+            // "Subsequent text (until a OSC "133;B" or OSC "133;I" command)
+            // is a prompt string (as if followed by OSC 133;P;k=i\007)."
+            screen.cursorSetSemanticContent(.{
+                .prompt = cmd.readOption(.prompt_kind) orelse .initial,
+            });
+
+            // This is a kitty-specific flag that notes that the shell
+            // is NOT capable of redraw. Redraw defaults to true so this
+            // usually just disables it, but either is possible.
+            if (cmd.readOption(.redraw)) |v| {
+                self.flags.shell_redraws_prompt = v;
+            }
+
+            click: {
+                // Handle click_events as a priority over cl. click_events
+                // is another Kitty-specific extension that converts clicks
+                // within a prompt area to SGR mouse events and defers to the
+                // shell to handle them.
+                if (cmd.readOption(.click_events)) |v| {
+                    if (v) {
+                        screen.semantic_prompt.click = .click_events;
+                        break :click;
+                    }
+                }
+
+                // If click_events was not set or disabled, fallback to `cl`.
+                if (cmd.readOption(.cl)) |v| {
+                    screen.semantic_prompt.click = .{ .cl = v };
+                }
+            }
+
+            // The "aid" and "cl" options are also valid for this
+            // command but we don't yet handle these in any meaningful way.
+        },
+
+        .new_command => {
+            // Spec:
+            // Same as OSC "133;A" but may first implicitly terminate a
+            // previous command: if the options specify an aid and there
+            // is an active (open) command with matching aid, finish the
+            // innermost such command (as well as any other commands
+            // nested more deeply). If no aid is specified, treat as an
+            // aid whose value is the empty string.
+
+            // Ghostty:
+            // We don't currently do explicit command tracking in any way
+            // so there is no need to terminate prior commands. We just
+            // perform the `A` action.
+            try self.semanticPrompt(.{
+                .action = .fresh_line_new_prompt,
+                .options_unvalidated = cmd.options_unvalidated,
+            });
+        },
+
+        .prompt_start => {
+            // Explicit start of prompt. Optional after an A or N command.
+            // The k (kind) option specifies the type of prompt:
+            // regular primary prompt (k=i or default),
+            // right-side prompts (k=r), or prompts for continuation lines (k=c or k=s).
+            self.screens.active.cursorSetSemanticContent(.{
+                .prompt = cmd.readOption(.prompt_kind) orelse .initial,
+            });
+        },
+
+        .end_prompt_start_input => {
+            // End of prompt and start of user input, terminated by a OSC
+            // "133;C" or another prompt (OSC "133;P").
+            self.screens.active.cursorSetSemanticContent(.{
+                .input = .clear_explicit,
+            });
+        },
+
+        .end_prompt_start_input_terminate_eol => {
+            // End of prompt and start of user input, terminated by end-of-line.
+            self.screens.active.cursorSetSemanticContent(.{
+                .input = .clear_eol,
+            });
+        },
+
+        .end_input_start_output => {
+            // "End of input, and start of output."
+            self.screens.active.cursorSetSemanticContent(.output);
+
+            // If our current row is marked as a prompt and we're
+            // at column zero then we assume we're un-prompting. This
+            // is a heuristic to deal with fish, mostly. The issue that
+            // fish brings up is that it has no PS2 equivalent and its
+            // builtin OSC133 marking doesn't output continuation lines
+            // as k=s. So, we assume when we get a newline with a prompt
+            // cursor that the new line is also a prompt. But fish changes
+            // to output on the newline. So if we're at col 0 we just assume
+            // we're overwriting the prompt.
+            if (self.screens.active.cursor.page_row.semantic_prompt != .none and
+                self.screens.active.cursor.x == 0)
+            {
+                self.screens.active.cursor.page_row.semantic_prompt = .none;
+            }
+        },
+
+        .end_command => {
+            // From a terminal state perspective, this doesn't really do
+            // anything. Other terminals appear to do nothing here. I think
+            // its reasonable at this point to reset our semantic content
+            // state but the spec doesn't really say what to do.
+            self.screens.active.cursorSetSemanticContent(.output);
+        },
+    }
+}
+
+// OSC 133;L
+fn semanticPromptFreshLine(self: *Terminal) !void {
+    const left_margin = if (self.screens.active.cursor.x < self.scrolling_region.left)
+        0
+    else
+        self.scrolling_region.left;
+
+    // Spec: "If the cursor is the initial column (left, assuming
+    // left-to-right writing), do nothing" This specification is very under
+    // specified. We are taking the liberty to assume that in a left/right
+    // margin context, if the cursor is outside of the left margin, we treat
+    // it as being at the left margin for the purposes of this command.
+    // This is arbitrary. If someone has a better reasonable idea we can
+    // apply it.
+    if (self.screens.active.cursor.x == left_margin) return;
+
+    self.carriageReturn();
+    try self.index();
+}
+
 /// The semantic prompt type. This is used when tracking a line type and
 /// requires integration with the shell. By default, we mark a line as "none"
 /// meaning we don't know what type it is.
@@ -1069,19 +1297,6 @@ pub const SemanticPrompt = enum {
     command,
 };
 
-/// Mark the current semantic prompt information. Current escape sequences
-/// (OSC 133) only allow setting this for wherever the current active cursor
-/// is located.
-pub fn markSemanticPrompt(self: *Terminal, p: SemanticPrompt) void {
-    //log.debug("semantic_prompt y={} p={}", .{ self.screens.active.cursor.y, p });
-    self.screens.active.cursor.page_row.semantic_prompt = switch (p) {
-        .prompt => .prompt,
-        .prompt_continuation => .prompt_continuation,
-        .input => .input,
-        .command => .command,
-    };
-}
-
 /// Returns true if the cursor is currently at a prompt. Another way to look
 /// at this is it returns false if the shell is currently outputting something.
 /// This requires shell integration (semantic prompt integration).
@@ -1091,29 +1306,15 @@ pub fn cursorIsAtPrompt(self: *Terminal) bool {
     // If we're on the secondary screen, we're never at a prompt.
     if (self.screens.active_key == .alternate) return false;
 
-    // Reverse through the active
-    const start_x, const start_y = .{ self.screens.active.cursor.x, self.screens.active.cursor.y };
-    defer self.screens.active.cursorAbsolute(start_x, start_y);
+    // If our page row is a prompt then we're always at a prompt
+    const cursor: *const Screen.Cursor = &self.screens.active.cursor;
+    if (cursor.page_row.semantic_prompt != .none) return true;
 
-    for (0..start_y + 1) |i| {
-        if (i > 0) self.screens.active.cursorUp(1);
-        switch (self.screens.active.cursor.page_row.semantic_prompt) {
-            // If we're at a prompt or input area, then we are at a prompt.
-            .prompt,
-            .prompt_continuation,
-            .input,
-            => return true,
-
-            // If we have command output, then we're most certainly not
-            // at a prompt.
-            .command => return false,
-
-            // If we don't know, we keep searching.
-            .unknown => {},
-        }
-    }
-
-    return false;
+    // Otherwise, determine our cursor state
+    return switch (cursor.semantic_content) {
+        .input, .prompt => true,
+        .output => false,
+    };
 }
 
 /// Horizontal tab moves the cursor to the next tabstop, clearing
@@ -1178,17 +1379,48 @@ pub fn tabReset(self: *Terminal) void {
 ///
 /// This unsets the pending wrap state without wrapping.
 pub fn index(self: *Terminal) !void {
+    const screen: *Screen = self.screens.active;
+
     // Unset pending wrap state
-    self.screens.active.cursor.pending_wrap = false;
+    screen.cursor.pending_wrap = false;
+
+    // We handle our cursor semantic prompt state AFTER doing the
+    // scrolling, because we may need to apply to new rows.
+    defer if (screen.cursor.semantic_content != .output) {
+        @branchHint(.unlikely);
+
+        // Always reset any semantic content clear-eol state.
+        //
+        // The specification is not clear what "end-of-line" means. If we
+        // discover that there are more scenarios we should be unsetting
+        // this we should document and test it.
+        if (screen.cursor.semantic_content_clear_eol) {
+            screen.cursor.semantic_content = .output;
+            screen.cursor.semantic_content_clear_eol = false;
+        } else {
+            // If we aren't clearing our state at EOL and we're not output,
+            // then we mark the new row as a prompt continuation. This is
+            // to work around shells that don't send OSC 133 k=s sequences
+            // for continuations.
+            //
+            // This can be a false positive if the shell changes content
+            // type later and outputs something. We handle that in the
+            // semanticPrompt function.
+            screen.cursor.page_row.semantic_prompt = .prompt_continuation;
+        }
+    } else {
+        // This should never be set in the output mode.
+        assert(!screen.cursor.semantic_content_clear_eol);
+    };
 
     // Outside of the scroll region we move the cursor one line down.
-    if (self.screens.active.cursor.y < self.scrolling_region.top or
-        self.screens.active.cursor.y > self.scrolling_region.bottom)
+    if (screen.cursor.y < self.scrolling_region.top or
+        screen.cursor.y > self.scrolling_region.bottom)
     {
         // We only move down if we're not already at the bottom of
         // the screen.
-        if (self.screens.active.cursor.y < self.rows - 1) {
-            self.screens.active.cursorDown(1);
+        if (screen.cursor.y < self.rows - 1) {
+            screen.cursorDown(1);
         }
 
         return;
@@ -1197,13 +1429,13 @@ pub fn index(self: *Terminal) !void {
     // If the cursor is inside the scrolling region and on the bottom-most
     // line, then we scroll up. If our scrolling region is the full screen
     // we create scrollback.
-    if (self.screens.active.cursor.y == self.scrolling_region.bottom and
-        self.screens.active.cursor.x >= self.scrolling_region.left and
-        self.screens.active.cursor.x <= self.scrolling_region.right)
+    if (screen.cursor.y == self.scrolling_region.bottom and
+        screen.cursor.x >= self.scrolling_region.left and
+        screen.cursor.x <= self.scrolling_region.right)
     {
         if (comptime build_options.kitty_graphics) {
             // Scrolling dirties the images because it updates their placements pins.
-            self.screens.active.kitty_images.dirty = true;
+            screen.kitty_images.dirty = true;
         }
 
         // If our scrolling region is at the top, we create scrollback.
@@ -1211,7 +1443,7 @@ pub fn index(self: *Terminal) !void {
             self.scrolling_region.left == 0 and
             self.scrolling_region.right == self.cols - 1)
         {
-            try self.screens.active.cursorScrollAbove();
+            try screen.cursorScrollAbove();
             return;
         }
 
@@ -1225,7 +1457,7 @@ pub fn index(self: *Terminal) !void {
             // However, scrollUp is WAY slower. We should optimize this
             // case to work in the eraseRowBounded codepath and remove
             // this check.
-            !self.screens.active.blankCell().isZero())
+            !screen.blankCell().isZero())
         {
             try self.scrollUp(1);
             return;
@@ -1235,9 +1467,9 @@ pub fn index(self: *Terminal) !void {
         // scroll the contents of the scrolling region.
 
         // Preserve old cursor just for assertions
-        const old_cursor = self.screens.active.cursor;
+        const old_cursor = screen.cursor;
 
-        try self.screens.active.pages.eraseRowBounded(
+        try screen.pages.eraseRowBounded(
             .{ .active = .{ .y = self.scrolling_region.top } },
             self.scrolling_region.bottom - self.scrolling_region.top,
         );
@@ -1246,26 +1478,26 @@ pub fn index(self: *Terminal) !void {
         // up by 1, so we need to move it back down. A `cursorReload`
         // would be better option but this is more efficient and this is
         // a super hot path so we do this instead.
-        assert(self.screens.active.cursor.x == old_cursor.x);
-        assert(self.screens.active.cursor.y == old_cursor.y);
-        self.screens.active.cursor.y -= 1;
-        self.screens.active.cursorDown(1);
+        assert(screen.cursor.x == old_cursor.x);
+        assert(screen.cursor.y == old_cursor.y);
+        screen.cursor.y -= 1;
+        screen.cursorDown(1);
 
         // The operations above can prune our cursor style so we need to
         // update. This should never fail because the above can only FREE
         // memory.
-        self.screens.active.manualStyleUpdate() catch |err| {
+        screen.manualStyleUpdate() catch |err| {
             std.log.warn("deleteLines manualStyleUpdate err={}", .{err});
-            self.screens.active.cursor.style = .{};
-            self.screens.active.manualStyleUpdate() catch unreachable;
+            screen.cursor.style = .{};
+            screen.manualStyleUpdate() catch unreachable;
         };
 
         return;
     }
 
     // Increase cursor by 1, maximum to bottom of scroll region
-    if (self.screens.active.cursor.y < self.scrolling_region.bottom) {
-        self.screens.active.cursorDown(1);
+    if (screen.cursor.y < self.scrolling_region.bottom) {
+        screen.cursorDown(1);
     }
 }
 
@@ -1460,7 +1692,7 @@ pub const ScrollViewport = union(enum) {
 };
 
 /// Scroll the viewport of the terminal grid.
-pub fn scrollViewport(self: *Terminal, behavior: ScrollViewport) !void {
+pub fn scrollViewport(self: *Terminal, behavior: ScrollViewport) void {
     self.screens.active.scroll(switch (behavior) {
         .top => .{ .top = {} },
         .bottom => .{ .active = {} },
@@ -2247,15 +2479,11 @@ pub fn eraseDisplay(
                         // If we're at a prompt or input area, then we are at a prompt.
                         .prompt,
                         .prompt_continuation,
-                        .input,
                         => break,
 
                         // If we have command output, then we're most certainly not
                         // at a prompt.
-                        .command => break :at_prompt,
-
-                        // If we don't know, we keep searching.
-                        .unknown => {},
+                        .none => break :at_prompt,
                     }
                 } else break :at_prompt;
 
@@ -2562,21 +2790,19 @@ pub fn resize(
 
     // Resize primary screen, which supports reflow
     const primary = self.screens.get(.primary).?;
-    if (self.screens.active_key == .primary and
-        self.flags.shell_redraws_prompt)
-    {
-        primary.clearPrompt();
-    }
-    if (self.modes.get(.wraparound)) {
-        try primary.resize(cols, rows);
-    } else {
-        try primary.resizeWithoutReflow(cols, rows);
-    }
+    try primary.resize(.{
+        .cols = cols,
+        .rows = rows,
+        .reflow = self.modes.get(.wraparound),
+        .prompt_redraw = self.flags.shell_redraws_prompt,
+    });
 
     // Alternate screen, if it exists, doesn't reflow
-    if (self.screens.get(.alternate)) |alt| {
-        try alt.resizeWithoutReflow(cols, rows);
-    }
+    if (self.screens.get(.alternate)) |alt| try alt.resize(.{
+        .cols = cols,
+        .rows = rows,
+        .reflow = false,
+    });
 
     // Whenever we resize we just mark it as a screen clear
     self.flags.dirty.clear = true;
@@ -3675,19 +3901,23 @@ test "Terminal: print invalid VS15 in emoji ZWJ sequence" {
 }
 
 test "Terminal: VS15 to make narrow character with pending wrap" {
-    var t = try init(testing.allocator, .{ .rows = 5, .cols = 2 });
+    var t = try init(testing.allocator, .{ .rows = 5, .cols = 4 });
     defer t.deinit(testing.allocator);
 
     // Enable grapheme clustering
     t.modes.set(.grapheme_cluster, true);
 
+    try testing.expect(t.modes.get(.wraparound));
+
+    try t.print(0x1F34B); // Lemon, width=2
     try t.print(0x2614); // Umbrella with rain drops, width=2
     try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
     t.clearDirty();
 
-    // We only move one because we're in a pending wrap state.
+    // We only move to the end of the line because we're in a pending wrap
+    // state.
     try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
-    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(usize, 3), t.screens.active.cursor.x);
     try testing.expect(t.screens.active.cursor.pending_wrap);
 
     try t.print(0xFE0E); // VS15 to make narrow
@@ -3696,23 +3926,119 @@ test "Terminal: VS15 to make narrow character with pending wrap" {
 
     // VS15 should clear the pending wrap state
     try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
-    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(usize, 3), t.screens.active.cursor.x);
     try testing.expect(!t.screens.active.cursor.pending_wrap);
 
     {
         const str = try t.plainString(testing.allocator);
         defer testing.allocator.free(str);
-        try testing.expectEqualStrings("☔︎", str);
+        try testing.expectEqualStrings("🍋☔︎", str);
     }
 
     {
-        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 2, .y = 0 } }).?;
         const cell = list_cell.cell;
         try testing.expectEqual(@as(u21, 0x2614), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.narrow, cell.wide);
         const cps = list_cell.node.data.lookupGrapheme(cell).?;
         try testing.expectEqual(@as(usize, 1), cps.len);
+    }
+
+    // VS15 should not affect the previous grapheme
+    {
+        const lemon_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?.cell;
+        try testing.expectEqual(@as(u21, 0x1F34B), lemon_cell.content.codepoint);
+        try testing.expectEqual(Cell.Wide.wide, lemon_cell.wide);
+        const spacer_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 1, .y = 0 } }).?.cell;
+        try testing.expectEqual(@as(u21, 0), spacer_cell.content.codepoint);
+        try testing.expectEqual(Cell.Wide.spacer_tail, spacer_cell.wide);
+    }
+}
+
+test "Terminal: VS16 to make wide character on next line" {
+    var t = try init(testing.allocator, .{ .rows = 5, .cols = 3 });
+    defer t.deinit(testing.allocator);
+
+    // Enable grapheme clustering
+    t.modes.set(.grapheme_cluster, true);
+
+    t.cursorRight(2);
+    try t.print('#');
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 2, .y = 0 } }));
+    t.clearDirty();
+
+    try t.print(0xFE0F); // VS16 to make wide
+
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 2, .y = 0 } }));
+    t.clearDirty();
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+    try testing.expect(!t.screens.active.cursor.pending_wrap);
+
+    {
+        // Previous cell turns into spacer_head
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 2, .y = 0 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 0), cell.content.codepoint);
+        try testing.expect(!cell.hasGrapheme());
+        try testing.expectEqual(Cell.Wide.spacer_head, cell.wide);
+    }
+    {
+        // '#' cell is wide
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, '#'), cell.content.codepoint);
+        try testing.expect(cell.hasGrapheme());
+        try testing.expectEqualSlices(u21, &.{0xFE0F}, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqual(Cell.Wide.wide, cell.wide);
+    }
+    {
+        // spacer_tail
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 1, .y = 1 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 0), cell.content.codepoint);
+        try testing.expect(!cell.hasGrapheme());
+        try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
+    }
+}
+
+test "Terminal: VS16 to make wide character with pending wrap" {
+    var t = try init(testing.allocator, .{ .rows = 5, .cols = 3 });
+    defer t.deinit(testing.allocator);
+
+    // Enable grapheme clustering
+    t.modes.set(.grapheme_cluster, true);
+
+    t.cursorRight(1);
+    try t.print('#');
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+    try testing.expect(!t.screens.active.cursor.pending_wrap);
+
+    try t.print(0xFE0F); // VS16 to make wide
+
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+
+    {
+        // '#' cell is wide
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 1, .y = 0 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, '#'), cell.content.codepoint);
+        try testing.expect(cell.hasGrapheme());
+        try testing.expectEqualSlices(u21, &.{0xFE0F}, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqual(Cell.Wide.wide, cell.wide);
+    }
+    {
+        // spacer_tail
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 2, .y = 0 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 0), cell.content.codepoint);
+        try testing.expect(!cell.hasGrapheme());
+        try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
     }
 }
 
@@ -3851,6 +4177,173 @@ test "Terminal: print invalid VS16 with second char" {
         try testing.expectEqual(@as(u21, 'y'), cell.content.codepoint);
         try testing.expect(!cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.narrow, cell.wide);
+    }
+}
+
+test "Terminal: print grapheme ò (o with nonspacing mark) should be narrow" {
+    var t = try init(testing.allocator, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(testing.allocator);
+
+    // Enable grapheme clustering
+    t.modes.set(.grapheme_cluster, true);
+
+    try t.print('o');
+    try t.print(0x0300); // combining grave accent
+
+    // We should have 1 cell taken up.
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.x);
+
+    // Assert various properties about our screen to verify
+    // we have all expected cells.
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 'o'), cell.content.codepoint);
+        try testing.expect(cell.hasGrapheme());
+        try testing.expectEqualSlices(u21, &.{0x0300}, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqual(Cell.Wide.narrow, cell.wide);
+    }
+}
+
+test "Terminal: print Devanagari grapheme should be wide" {
+    var t = try init(testing.allocator, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(testing.allocator);
+
+    // Enable grapheme clustering
+    t.modes.set(.grapheme_cluster, true);
+
+    // क्‍ष
+    try t.print(0x0915);
+    try t.print(0x094D);
+    try t.print(0x200D);
+    try t.print(0x0937);
+
+    // We should have 2 cells taken up. It is one character but "wide".
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+
+    // Assert various properties about our screen to verify
+    // we have all expected cells.
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 0x0915), cell.content.codepoint);
+        try testing.expect(cell.hasGrapheme());
+        try testing.expectEqualSlices(u21, &.{ 0x094D, 0x200D, 0x0937 }, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqual(Cell.Wide.wide, cell.wide);
+    }
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 1, .y = 0 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
+    }
+}
+
+test "Terminal: print Devanagari grapheme should be wide on next line" {
+    var t = try init(testing.allocator, .{ .rows = 5, .cols = 3 });
+    defer t.deinit(testing.allocator);
+
+    // Enable grapheme clustering
+    t.modes.set(.grapheme_cluster, true);
+
+    t.cursorRight(2);
+
+    // क्‍ष
+    try t.print(0x0915);
+    try t.print(0x094D);
+    try t.print(0x200D);
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+
+    // This one increases the width to wide
+    try t.print(0x0937);
+
+    // We should have 2 cells taken up. It is one character but "wide".
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+    try testing.expect(!t.screens.active.cursor.pending_wrap);
+
+    {
+        // Previous cell turns into spacer_head
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 2, .y = 0 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 0), cell.content.codepoint);
+        try testing.expect(!cell.hasGrapheme());
+        try testing.expectEqual(Cell.Wide.spacer_head, cell.wide);
+    }
+    {
+        // Devanagari grapheme is wide
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 0x0915), cell.content.codepoint);
+        try testing.expect(cell.hasGrapheme());
+        try testing.expectEqualSlices(u21, &.{ 0x094D, 0x200D, 0x0937 }, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqual(Cell.Wide.wide, cell.wide);
+    }
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 1, .y = 1 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
+    }
+}
+
+test "Terminal: print Devanagari grapheme should be wide on next page" {
+    const rows = pagepkg.std_capacity.rows;
+    const cols = pagepkg.std_capacity.cols;
+    var t = try init(testing.allocator, .{ .rows = rows, .cols = cols });
+    defer t.deinit(testing.allocator);
+
+    // Enable grapheme clustering
+    t.modes.set(.grapheme_cluster, true);
+
+    t.cursorDown(rows - 1);
+
+    for (rows..t.screens.active.pages.pages.first.?.data.capacity.rows) |_| {
+        try t.index();
+    }
+
+    t.cursorRight(cols - 1);
+
+    try testing.expectEqual(cols - 1, t.screens.active.cursor.x);
+    try testing.expectEqual(rows - 1, t.screens.active.cursor.y);
+
+    // क्‍ष
+    try t.print(0x0915);
+    try t.print(0x094D);
+    try t.print(0x200D);
+    try testing.expectEqual(cols - 1, t.screens.active.cursor.x);
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+
+    // This one increases the width to wide
+    try t.print(0x0937);
+
+    // We should have 2 cells taken up. It is one character but "wide".
+    try testing.expectEqual(rows - 1, t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
+    try testing.expect(!t.screens.active.cursor.pending_wrap);
+
+    {
+        // Previous cell turns into spacer_head
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = cols - 1, .y = rows - 2 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 0), cell.content.codepoint);
+        try testing.expect(!cell.hasGrapheme());
+        try testing.expectEqual(Cell.Wide.spacer_head, cell.wide);
+    }
+    {
+        // Devanagari grapheme is wide
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = rows - 1 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 0x0915), cell.content.codepoint);
+        try testing.expect(cell.hasGrapheme());
+        try testing.expectEqualSlices(u21, &.{ 0x094D, 0x200D, 0x0937 }, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqual(Cell.Wide.wide, cell.wide);
+    }
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 1, .y = rows - 1 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
     }
 }
 
@@ -4221,19 +4714,20 @@ test "Terminal: soft wrap with semantic prompt" {
     var t = try init(testing.allocator, .{ .cols = 3, .rows = 80 });
     defer t.deinit(testing.allocator);
 
-    // Mark our prompt. Should not make anything dirty on its own.
-    t.markSemanticPrompt(.prompt);
+    // Mark our prompt.
+    try t.semanticPrompt(.init(.prompt_start));
+    // Should not make anything dirty on its own.
     try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
 
+    // Write and wrap
     for ("hello") |c| try t.print(c);
-
     {
         const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
-        try testing.expectEqual(Row.SemanticPrompt.prompt, list_cell.row.semantic_prompt);
+        try testing.expectEqual(.prompt, list_cell.row.semantic_prompt);
     }
     {
         const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
-        try testing.expectEqual(Row.SemanticPrompt.prompt, list_cell.row.semantic_prompt);
+        try testing.expectEqual(.prompt_continuation, list_cell.row.semantic_prompt);
     }
 }
 
@@ -11184,33 +11678,446 @@ test "Terminal: eraseDisplay complete preserves cursor" {
     try testing.expect(t.screens.active.cursor.style_id != style.default_id);
 }
 
+test "Terminal: semantic prompt" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Prompt
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    for ("hello") |c| try t.print(c);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 5), t.screens.active.cursor.x);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = t.screens.active.cursor.x - 1,
+            .y = t.screens.active.cursor.y,
+        } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(.prompt, cell.semantic_content);
+
+        const row = list_cell.row;
+        try testing.expectEqual(.prompt, row.semantic_prompt);
+    }
+
+    // Start input but end it on EOL
+    try t.semanticPrompt(.init(.end_prompt_start_input_terminate_eol));
+    t.carriageReturn();
+    try t.linefeed();
+
+    // Write some output
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.x);
+    for ("world") |c| try t.print(c);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = t.screens.active.cursor.x - 1,
+            .y = t.screens.active.cursor.y,
+        } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(.output, cell.semantic_content);
+
+        const row = list_cell.row;
+        try testing.expectEqual(.none, row.semantic_prompt);
+    }
+}
+
+test "Terminal: semantic prompt continuations" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Prompt
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    for ("hello") |c| try t.print(c);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 5), t.screens.active.cursor.x);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = t.screens.active.cursor.x - 1,
+            .y = t.screens.active.cursor.y,
+        } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(.prompt, cell.semantic_content);
+
+        const row = list_cell.row;
+        try testing.expectEqual(.prompt, row.semantic_prompt);
+    }
+
+    // Start input but end it on EOL
+    t.carriageReturn();
+    try t.linefeed();
+    try t.semanticPrompt(.{
+        .action = .prompt_start,
+        .options_unvalidated = "k=c",
+    });
+
+    // Write some output
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.x);
+    for ("world") |c| try t.print(c);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = t.screens.active.cursor.x - 1,
+            .y = t.screens.active.cursor.y,
+        } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(.prompt, cell.semantic_content);
+
+        const row = list_cell.row;
+        try testing.expectEqual(.prompt_continuation, row.semantic_prompt);
+    }
+}
+
+test "Terminal: index in prompt mode marks new row as prompt continuation" {
+    // This tests the Fish shell workaround: when in prompt mode and we get
+    // a newline, assume the new row is a prompt continuation (since Fish
+    // doesn't emit OSC133 k=s markers for continuation lines).
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Start a prompt
+    try t.semanticPrompt(.init(.prompt_start));
+    for ("hello") |c| try t.print(c);
+
+    // Verify first row is marked as prompt
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = 0,
+        } }).?;
+        try testing.expectEqual(.prompt, list_cell.row.semantic_prompt);
+    }
+
+    // Now do a linefeed while still in prompt mode
+    t.carriageReturn();
+    try t.linefeed();
+
+    // The new row should automatically be marked as prompt continuation
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = 1,
+        } }).?;
+        try testing.expectEqual(.prompt_continuation, list_cell.row.semantic_prompt);
+    }
+
+    // The cursor semantic content should still be prompt
+    try testing.expectEqual(.prompt, t.screens.active.cursor.semantic_content);
+}
+
+test "Terminal: index in input mode does not mark new row as prompt" {
+    // Input mode should NOT trigger prompt continuation on newline
+    // (only prompt mode does, not input mode)
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Start a prompt then switch to input
+    try t.semanticPrompt(.init(.prompt_start));
+    for ("$ ") |c| try t.print(c);
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    for ("echo \\") |c| try t.print(c);
+
+    // Linefeed while in input mode
+    t.carriageReturn();
+    try t.linefeed();
+
+    // The new row should be marked as prompt continuation
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = 1,
+        } }).?;
+        try testing.expectEqual(.prompt_continuation, list_cell.row.semantic_prompt);
+    }
+
+    // Our cursor should still be in input
+    try testing.expectEqual(.input, t.screens.active.cursor.semantic_content);
+}
+
+test "Terminal: index in output mode does not mark new row as prompt" {
+    // Output mode should NOT trigger prompt continuation
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Complete prompt cycle: prompt -> input -> output
+    try t.semanticPrompt(.init(.prompt_start));
+    for ("$ ") |c| try t.print(c);
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    for ("ls") |c| try t.print(c);
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    // Linefeed while in output mode
+    t.carriageReturn();
+    try t.linefeed();
+
+    // The new row should NOT be marked as a prompt
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = 1,
+        } }).?;
+        try testing.expectEqual(.none, list_cell.row.semantic_prompt);
+    }
+}
+
+test "Terminal: OSC133C at x=0 on prompt row clears prompt mark" {
+    // This tests the second Fish heuristic: when Fish emits a newline
+    // then immediately sends OSC133C (start output) at column 0, we
+    // should clear the prompt continuation mark we just set.
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Start a prompt
+    try t.semanticPrompt(.init(.prompt_start));
+    for ("$ echo \\") |c| try t.print(c);
+
+    // Simulate Fish behavior: newline first (which marks next row as prompt)
+    t.carriageReturn();
+    try t.linefeed();
+
+    // Verify the new row is marked as prompt continuation
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = 1,
+        } }).?;
+        try testing.expectEqual(.prompt_continuation, list_cell.row.semantic_prompt);
+    }
+
+    // Now Fish sends OSC133C at column 0 (cursor is still at x=0)
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.x);
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    // The prompt continuation should be cleared
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = 1,
+        } }).?;
+        try testing.expectEqual(.none, list_cell.row.semantic_prompt);
+    }
+}
+
+test "Terminal: OSC133C at x>0 on prompt row does not clear prompt mark" {
+    // If we're not at column 0, we shouldn't clear the prompt mark
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Start a prompt on a row
+    try t.semanticPrompt(.init(.prompt_start));
+    for ("$ ") |c| try t.print(c);
+
+    // Move to a new line and mark it as prompt continuation manually
+    t.carriageReturn();
+    try t.linefeed();
+    try t.semanticPrompt(.{
+        .action = .prompt_start,
+        .options_unvalidated = "k=c",
+    });
+    for ("> ") |c| try t.print(c);
+
+    // Verify the row is marked as prompt continuation
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = 1,
+        } }).?;
+        try testing.expectEqual(.prompt_continuation, list_cell.row.semantic_prompt);
+    }
+
+    // Now send OSC133C but cursor is NOT at column 0
+    try testing.expect(t.screens.active.cursor.x > 0);
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    // The prompt continuation should NOT be cleared (we're not at x=0)
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = 1,
+        } }).?;
+        try testing.expectEqual(.prompt_continuation, list_cell.row.semantic_prompt);
+    }
+}
+
+test "Terminal: multiple newlines in prompt mode marks all rows" {
+    // Multiple newlines should each mark their row as prompt continuation
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Start a prompt
+    try t.semanticPrompt(.init(.prompt_start));
+    for ("line1") |c| try t.print(c);
+
+    // Multiple newlines
+    t.carriageReturn();
+    try t.linefeed();
+    for ("line2") |c| try t.print(c);
+    t.carriageReturn();
+    try t.linefeed();
+    for ("line3") |c| try t.print(c);
+
+    // First row should be prompt
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = 0,
+        } }).?;
+        try testing.expectEqual(.prompt, list_cell.row.semantic_prompt);
+    }
+
+    // Second and third rows should be prompt continuation
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = 1,
+        } }).?;
+        try testing.expectEqual(.prompt_continuation, list_cell.row.semantic_prompt);
+    }
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+            .x = 0,
+            .y = 2,
+        } }).?;
+        try testing.expectEqual(.prompt_continuation, list_cell.row.semantic_prompt);
+    }
+}
+
+test "Terminal: OSC133A click_events=1 sets click to click_events" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Verify default state is none
+    try testing.expectEqual(.none, t.screens.active.semantic_prompt.click);
+
+    // OSC 133;A with click_events=1
+    try t.semanticPrompt(.{
+        .action = .fresh_line_new_prompt,
+        .options_unvalidated = "click_events=1",
+    });
+
+    try testing.expectEqual(.click_events, t.screens.active.semantic_prompt.click);
+}
+
+test "Terminal: OSC133A click_events=0 does not set click_events" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // OSC 133;A with click_events=0
+    try t.semanticPrompt(.{
+        .action = .fresh_line_new_prompt,
+        .options_unvalidated = "click_events=0",
+    });
+
+    // Should remain none since click_events=0 doesn't activate anything
+    try testing.expectEqual(.none, t.screens.active.semantic_prompt.click);
+}
+
+test "Terminal: OSC133A cl option sets click to cl value" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // OSC 133;A with cl=m (multiple)
+    try t.semanticPrompt(.{
+        .action = .fresh_line_new_prompt,
+        .options_unvalidated = "cl=m",
+    });
+
+    try testing.expectEqual(Screen.SemanticPrompt.SemanticClick{ .cl = .multiple }, t.screens.active.semantic_prompt.click);
+}
+
+test "Terminal: OSC133A cl=line sets click to line" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.{
+        .action = .fresh_line_new_prompt,
+        .options_unvalidated = "cl=line",
+    });
+
+    try testing.expectEqual(Screen.SemanticPrompt.SemanticClick{ .cl = .line }, t.screens.active.semantic_prompt.click);
+}
+
+test "Terminal: OSC133A click_events=1 takes priority over cl" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // OSC 133;A with both click_events=1 and cl=m
+    try t.semanticPrompt(.{
+        .action = .fresh_line_new_prompt,
+        .options_unvalidated = "click_events=1;cl=m",
+    });
+
+    // click_events should take priority
+    try testing.expectEqual(.click_events, t.screens.active.semantic_prompt.click);
+}
+
+test "Terminal: OSC133A click_events=0 falls back to cl" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // OSC 133;A with click_events=0 and cl=v
+    try t.semanticPrompt(.{
+        .action = .fresh_line_new_prompt,
+        .options_unvalidated = "click_events=0;cl=v",
+    });
+
+    // Should fall back to cl since click_events is disabled
+    try testing.expectEqual(Screen.SemanticPrompt.SemanticClick{ .cl = .conservative_vertical }, t.screens.active.semantic_prompt.click);
+}
+
+test "Terminal: OSC133A no click options leaves click as none" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // OSC 133;A with no click-related options
+    try t.semanticPrompt(.{
+        .action = .fresh_line_new_prompt,
+        .options_unvalidated = "aid=123",
+    });
+
+    try testing.expectEqual(.none, t.screens.active.semantic_prompt.click);
+}
+
 test "Terminal: cursorIsAtPrompt" {
     const alloc = testing.allocator;
-    var t = try init(alloc, .{ .cols = 3, .rows = 2 });
+    var t = try init(alloc, .{ .cols = 10, .rows = 3 });
     defer t.deinit(alloc);
 
     try testing.expect(!t.cursorIsAtPrompt());
-    t.markSemanticPrompt(.prompt);
+    try t.semanticPrompt(.init(.prompt_start));
     try testing.expect(t.cursorIsAtPrompt());
+    for ("$ ") |c| try t.print(c);
 
     // Input is also a prompt
-    t.markSemanticPrompt(.input);
+    try t.semanticPrompt(.init(.end_prompt_start_input));
     try testing.expect(t.cursorIsAtPrompt());
-
-    // Newline -- we expect we're still at a prompt if we received
-    // prompt stuff before.
-    try t.linefeed();
-    try testing.expect(t.cursorIsAtPrompt());
+    for ("ls") |c| try t.print(c);
 
     // But once we say we're starting output, we're not a prompt
-    t.markSemanticPrompt(.command);
-    try testing.expect(!t.cursorIsAtPrompt());
+    // (cursor is not at x=0, so the Fish heuristic doesn't trigger)
+    try t.semanticPrompt(.init(.end_input_start_output));
+    // Still a prompt because this line has a prompt
+    try testing.expect(t.cursorIsAtPrompt());
     try t.linefeed();
     try testing.expect(!t.cursorIsAtPrompt());
 
     // Until we know we're at a prompt again
     try t.linefeed();
-    t.markSemanticPrompt(.prompt);
+    try t.semanticPrompt(.init(.prompt_start));
     try testing.expect(t.cursorIsAtPrompt());
 }
 
@@ -11220,13 +12127,13 @@ test "Terminal: cursorIsAtPrompt alternate screen" {
     defer t.deinit(alloc);
 
     try testing.expect(!t.cursorIsAtPrompt());
-    t.markSemanticPrompt(.prompt);
+    try t.semanticPrompt(.init(.prompt_start));
     try testing.expect(t.cursorIsAtPrompt());
 
     // Secondary screen is never a prompt
     try t.switchScreenMode(.@"1049", true);
     try testing.expect(!t.cursorIsAtPrompt());
-    t.markSemanticPrompt(.prompt);
+    try t.semanticPrompt(.init(.prompt_start));
     try testing.expect(!t.cursorIsAtPrompt());
 }
 
@@ -11236,6 +12143,7 @@ test "Terminal: fullReset with a non-empty pen" {
 
     try t.setAttribute(.{ .direct_color_fg = .{ .r = 0xFF, .g = 0, .b = 0x7F } });
     try t.setAttribute(.{ .direct_color_bg = .{ .r = 0xFF, .g = 0, .b = 0x7F } });
+    t.screens.active.cursor.semantic_content = .input;
     t.fullReset();
 
     {
@@ -11248,6 +12156,7 @@ test "Terminal: fullReset with a non-empty pen" {
     }
 
     try testing.expectEqual(@as(style.Id, 0), t.screens.active.cursor.style_id);
+    try testing.expectEqual(.output, t.screens.active.cursor.semantic_content);
 }
 
 test "Terminal: fullReset hyperlink" {
